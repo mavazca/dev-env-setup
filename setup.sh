@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 GREEN='\033[0;32m'
@@ -41,6 +42,12 @@ if [[ -z "${TARGET_HOME}" ]]; then
   exit 1
 fi
 
+# Evita que apt-get/dpkg fiquem esperando input interativo (ex.: prompts de
+# reinicio de servico, configuracao de teclado) quando o script roda de forma
+# nao assistida (CI, cloud-init, curl | bash).
+export DEBIAN_FRONTEND=noninteractive
+APT_GET="${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get"
+
 APT_UPDATED=0
 APT_SOURCES_CHANGED=0
 
@@ -60,7 +67,7 @@ run_as_target_user() {
 apt_update_once() {
   if [[ "${APT_UPDATED}" -eq 0 || "${APT_SOURCES_CHANGED}" -eq 1 ]]; then
     log "Atualizando cache de pacotes..."
-    ${SUDO} apt-get update -y
+    ${APT_GET} update -y
     APT_UPDATED=1
     APT_SOURCES_CHANGED=0
   fi
@@ -68,6 +75,10 @@ apt_update_once() {
 
 is_pkg_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
+apt_pkg_available() {
+  apt-cache show "$1" >/dev/null 2>&1
 }
 
 install_apt_packages() {
@@ -82,8 +93,25 @@ install_apt_packages() {
 
   if [[ "${#missing[@]}" -gt 0 ]]; then
     apt_update_once
-    log "Instalando pacotes: ${missing[*]}"
-    ${SUDO} apt-get install -y "${missing[@]}"
+
+    local to_install=()
+    local skipped=()
+    for pkg in "${missing[@]}"; do
+      if apt_pkg_available "${pkg}"; then
+        to_install+=("${pkg}")
+      else
+        skipped+=("${pkg}")
+      fi
+    done
+
+    if [[ "${#skipped[@]}" -gt 0 ]]; then
+      warn "Pacotes ainda indisponiveis no repositorio e ignorados (ex.: extensoes muito novas): ${skipped[*]}"
+    fi
+
+    if [[ "${#to_install[@]}" -gt 0 ]]; then
+      log "Instalando pacotes: ${to_install[*]}"
+      ${APT_GET} install -y "${to_install[@]}"
+    fi
   else
     info "Pacotes ja instalados: $*"
   fi
@@ -98,14 +126,28 @@ ensure_line_in_file() {
   fi
 }
 
-ensure_ondrej_php_repo() {
-  if ! grep -Rqs "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
-    log "Adicionando repositorio ondrej/php..."
-    install_apt_packages software-properties-common
-    ${SUDO} add-apt-repository -y ppa:ondrej/php
+ensure_php_sury_repo() {
+  # O ppa:ondrej/php nao publica pacotes para o Ubuntu 26.04 (resolute); o
+  # proprio mantenedor (Ondrej Sury) migrou para o repositorio
+  # packages.sury.org/php, que cobre resolute, noble e jammy.
+  local keyring="/usr/share/keyrings/debsuryorg-archive-keyring.gpg"
+  local source_file="/etc/apt/sources.list.d/php.list"
+
+  install_apt_packages lsb-release ca-certificates curl
+
+  if [[ ! -f "${keyring}" ]]; then
+    log "Configurando chave do repositorio PHP (Sury)..."
+    curl -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+    ${SUDO} env DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/debsuryorg-archive-keyring.deb
+    rm -f /tmp/debsuryorg-archive-keyring.deb
+  fi
+
+  if [[ ! -f "${source_file}" ]] || ! grep -q "packages.sury.org" "${source_file}"; then
+    log "Adicionando repositorio PHP (Sury)..."
+    echo "deb [signed-by=${keyring}] https://packages.sury.org/php/ $(lsb_release -sc) main" | ${SUDO} tee "${source_file}" >/dev/null
     APT_SOURCES_CHANGED=1
   else
-    info "Repositorio ondrej/php ja configurado"
+    info "Repositorio PHP (Sury) ja configurado"
   fi
 }
 
@@ -142,6 +184,14 @@ ensure_hashicorp_repo() {
     log "Adicionando repositorio HashiCorp..."
     local codename
     codename="$(lsb_release -cs)"
+    # O repositorio da HashiCorp pode demorar a publicar pacotes para
+    # codenames muito novos (ex.: 'resolute' no lancamento do Ubuntu
+    # 26.04); nesse caso caimos para o 'noble' (24.04), que e
+    # binario-compativel e funciona normalmente no 26.04.
+    if ! curl -fsSL -o /dev/null "https://apt.releases.hashicorp.com/dists/${codename}/Release"; then
+      warn "Repositorio HashiCorp ainda nao publica pacotes para '${codename}'. Usando 'noble' como fallback."
+      codename="noble"
+    fi
     echo "deb [signed-by=${keyring}] https://apt.releases.hashicorp.com ${codename} main" | ${SUDO} tee "${source_file}" >/dev/null
     APT_SOURCES_CHANGED=1
   else
@@ -149,18 +199,99 @@ ensure_hashicorp_repo() {
   fi
 }
 
+configure_locale_timezone() {
+  log "Configurando locale e timezone..."
+  install_apt_packages locales tzdata
+
+  # Gera os locales sem forcar qual fica ativo por padrao no sistema.
+  if ! locale -a 2>/dev/null | grep -qi "^en_US.utf8$"; then
+    ${SUDO} locale-gen en_US.UTF-8
+  fi
+  if ! locale -a 2>/dev/null | grep -qi "^pt_BR.utf8$"; then
+    ${SUDO} locale-gen pt_BR.UTF-8
+  fi
+
+  if [[ ! -f /etc/default/locale ]] || ! grep -q "^LANG=" /etc/default/locale 2>/dev/null; then
+    ${SUDO} update-locale LANG=en_US.UTF-8
+  fi
+
+  # Nao alteramos o fuso horario ja configurado na maquina (pode ter sido
+  # definido na instalacao do SO); apenas garantimos sincronizacao via NTP.
+  if command_exists timedatectl; then
+    ${SUDO} timedatectl set-ntp true >/dev/null 2>&1 || true
+    info "Timezone atual: $(timedatectl show -p Timezone --value 2>/dev/null)"
+  fi
+}
+
+configure_git() {
+  log "Configurando Git (defaults)..."
+
+  run_as_target_user "git config --global init.defaultBranch main" || true
+  run_as_target_user "git config --global pull.rebase false" || true
+  if command_exists code; then
+    run_as_target_user "git config --global core.editor 'code --wait'" || true
+  else
+    run_as_target_user "git config --global core.editor nano" || true
+  fi
+
+  local has_name has_email
+  has_name="$(run_as_target_user 'git config --global user.name' 2>/dev/null || true)"
+  has_email="$(run_as_target_user 'git config --global user.email' 2>/dev/null || true)"
+
+  if [[ -n "${has_name}" && -n "${has_email}" ]]; then
+    info "Git user.name/user.email ja configurados (${has_name} <${has_email}>)"
+    return
+  fi
+
+  if [[ -t 0 ]]; then
+    local git_name git_email
+    if [[ -z "${has_name}" ]]; then
+      read -rp "Nome para o Git (git config user.name): " git_name
+      if [[ -n "${git_name}" ]]; then
+        run_as_target_user "git config --global user.name $(printf '%q' "${git_name}")"
+      fi
+    fi
+    if [[ -z "${has_email}" ]]; then
+      read -rp "E-mail para o Git (git config user.email): " git_email
+      if [[ -n "${git_email}" ]]; then
+        run_as_target_user "git config --global user.email $(printf '%q' "${git_email}")"
+      fi
+    fi
+  else
+    warn "Execucao nao interativa: git user.name/user.email nao configurados."
+    warn "Configure manualmente com: git config --global user.name \"Seu Nome\" && git config --global user.email \"voce@exemplo.com\""
+  fi
+}
+
+install_db_clients() {
+  log "Instalando clientes de banco de dados (mysql, postgresql, redis)..."
+  install_apt_packages mysql-client postgresql-client redis-tools
+}
+
 prepare_environment() {
   log "Preparando ambiente base..."
-  install_apt_packages curl git vim lsb-release unzip zip jq dos2unix gnupg ca-certificates apt-transport-https build-essential fonts-firacode
-  ensure_ondrej_php_repo
+  install_apt_packages curl git vim nano lsb-release unzip zip jq dos2unix gnupg ca-certificates apt-transport-https build-essential fonts-firacode
+  configure_locale_timezone
+  configure_git
+  install_db_clients
+  ensure_php_sury_repo
   apt_update_once
 }
 
+install_cli_tools() {
+  install_github_cli
+  ensure_local_bin_in_path
+  install_claude_code_cli
+  install_codex_cli
+  install_kiro_cli
+  install_opencode_cli
+}
+
 install_php_versions() {
-  log "Instalando PHP 8.3 e 8.4 (com extensoes)..."
+  log "Instalando PHP 8.4 e 8.5 (com extensoes)..."
   install_apt_packages \
-    php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql php8.3-curl php8.3-intl php8.3-mbstring php8.3-bcmath php8.3-imap php8.3-xml php8.3-zip php8.3-bz2 php8.3-xdebug php8.3-redis php8.3-soap php8.3-sqlite3 php8.3-pgsql \
-    php8.4 php8.4-common php8.4-cli php8.4-gd php8.4-mysql php8.4-curl php8.4-intl php8.4-mbstring php8.4-bcmath php8.4-imap php8.4-xml php8.4-zip php8.4-bz2 php8.4-xdebug php8.4-redis php8.4-soap php8.4-sqlite3 php8.4-pgsql
+    php8.4 php8.4-common php8.4-cli php8.4-gd php8.4-mysql php8.4-curl php8.4-intl php8.4-mbstring php8.4-bcmath php8.4-imap php8.4-xml php8.4-zip php8.4-bz2 php8.4-xdebug php8.4-redis php8.4-soap php8.4-sqlite3 php8.4-pgsql \
+    php8.5 php8.5-common php8.5-cli php8.5-gd php8.5-mysql php8.5-curl php8.5-intl php8.5-mbstring php8.5-bcmath php8.5-imap php8.5-xml php8.5-zip php8.5-bz2 php8.5-xdebug php8.5-redis php8.5-soap php8.5-sqlite3 php8.5-pgsql
 
   if [[ -x /usr/bin/php8.4 ]]; then
     ${SUDO} update-alternatives --set php /usr/bin/php8.4 || true
@@ -245,25 +376,61 @@ install_yarn() {
     info "Yarn ja instalado"
     return
   fi
+
   ensure_yarn_repo
   apt_update_once
   install_apt_packages yarn
 }
 
+install_node() {
+  # Instala o NVM (mesmo gerenciador usado pelo plugin zsh-nvm) e ja deixa
+  # uma versao LTS do Node pronta, para o Yarn funcionar de imediato sem
+  # depender do usuario rodar 'nvm install' manualmente na primeira vez.
+  local nvm_version="v0.40.6"
+  local nvm_dir="${TARGET_HOME}/.nvm"
+
+  if [[ ! -s "${nvm_dir}/nvm.sh" ]]; then
+    log "Instalando NVM (${nvm_version})..."
+    run_as_target_user "export NVM_DIR=\"${nvm_dir}\"; curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_version}/install.sh | bash"
+  else
+    info "NVM ja instalado"
+  fi
+
+  if run_as_target_user "export NVM_DIR=\"${nvm_dir}\"; . \"${nvm_dir}/nvm.sh\" >/dev/null 2>&1; command -v node >/dev/null 2>&1"; then
+    info "Node.js ja instalado via NVM"
+  else
+    log "Instalando Node.js (ultima LTS) via NVM..."
+    run_as_target_user "export NVM_DIR=\"${nvm_dir}\"; . \"${nvm_dir}/nvm.sh\"; nvm install --lts"
+  fi
+
+  run_as_target_user "export NVM_DIR=\"${nvm_dir}\"; . \"${nvm_dir}/nvm.sh\"; nvm alias default 'lts/*'" >/dev/null 2>&1 || true
+}
+
 generate_ssh_key() {
-  local ssh_pub="${TARGET_HOME}/.ssh/id_rsa.pub"
+  local ssh_pub="${TARGET_HOME}/.ssh/id_ed25519.pub"
   if [[ ! -f "${ssh_pub}" ]]; then
-    log "Gerando chave SSH para ${TARGET_USER}..."
-    run_as_target_user 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && ssh-keygen -t rsa -f ~/.ssh/id_rsa -q -N ""'
+    log "Gerando chave SSH (ed25519) para ${TARGET_USER}..."
+    run_as_target_user 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -q -N ""'
   else
     info "Chave SSH ja existe em ${ssh_pub}"
   fi
 }
 
 install_kubernetes_tools() {
+  local arch
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      error "Arquitetura nao suportada para ferramentas Kubernetes: ${arch}"
+      return 1
+      ;;
+  esac
+
   if ! command_exists kubectl; then
-    log "Instalando kubectl..."
-    curl -fsSLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    log "Instalando kubectl (${arch})..."
+    curl -fsSLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${arch}/kubectl"
     chmod +x kubectl
     ${SUDO} mv kubectl /usr/local/bin/
   else
@@ -278,18 +445,18 @@ install_kubernetes_tools() {
   fi
 
   if ! command_exists hetzner-k3s; then
-    log "Instalando hetzner-k3s..."
-    ${SUDO} wget -q https://github.com/vitobotta/hetzner-k3s/releases/download/v2.6.0/hetzner-k3s-linux-amd64 -O /usr/local/bin/hetzner-k3s
+    log "Instalando hetzner-k3s (${arch})..."
+    ${SUDO} wget -q "https://github.com/vitobotta/hetzner-k3s/releases/latest/download/hetzner-k3s-linux-${arch}" -O /usr/local/bin/hetzner-k3s
     ${SUDO} chmod +x /usr/local/bin/hetzner-k3s
   else
     info "hetzner-k3s ja instalado"
   fi
 
   if ! command_exists hcloud; then
-    log "Instalando hcloud CLI..."
-    curl -fsSLO https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz
-    ${SUDO} tar -C /usr/local/bin --no-same-owner -xzf hcloud-linux-amd64.tar.gz hcloud
-    rm -f hcloud-linux-amd64.tar.gz
+    log "Instalando hcloud CLI (${arch})..."
+    curl -fsSLO "https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-${arch}.tar.gz"
+    ${SUDO} tar -C /usr/local/bin --no-same-owner -xzf "hcloud-linux-${arch}.tar.gz" hcloud
+    rm -f "hcloud-linux-${arch}.tar.gz"
   else
     info "hcloud CLI ja instalado"
   fi
@@ -312,7 +479,6 @@ configure_kube_aliases_and_direnv() {
     log "Criando arquivo de aliases Kubernetes..."
     cat > /tmp/.kube_aliases <<'EOF'
 # Aliases Kubernetes e Helm
-
 alias k='kubectl'
 alias kx='kubectx'
 alias kns='kubens'
@@ -350,12 +516,10 @@ EOF
   else
     info "Arquivo ${aliases_file} ja existe. Mantendo conteudo atual."
   fi
-
   dos2unix "${aliases_file}" >/dev/null 2>&1 || true
 
   local bashrc="${TARGET_HOME}/.bashrc"
   local zshrc="${TARGET_HOME}/.zshrc"
-
   ensure_line_in_file 'eval "$(direnv hook bash)"' "${bashrc}"
   ensure_line_in_file 'source ~/.kube_aliases' "${bashrc}"
   ensure_line_in_file 'eval "$(direnv hook zsh)"' "${zshrc}"
@@ -398,7 +562,6 @@ install_session_manager_plugin() {
   local arch
   local deb_url
   arch="$(uname -m)"
-
   case "${arch}" in
     x86_64)
       deb_url="https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
@@ -414,7 +577,7 @@ install_session_manager_plugin() {
 
   local deb_file="/tmp/session-manager-plugin.deb"
   curl -fsSL "${deb_url}" -o "${deb_file}"
-  ${SUDO} dpkg -i "${deb_file}" || ${SUDO} apt-get install -f -y
+  ${SUDO} env DEBIAN_FRONTEND=noninteractive dpkg -i "${deb_file}" || ${APT_GET} install -f -y
   rm -f "${deb_file}"
 }
 
@@ -429,9 +592,163 @@ install_terraform() {
   install_apt_packages terraform
 }
 
+install_java() {
+  # A partir do Ubuntu 25.04/25.10 e 26.04 (resolute), o openjdk-25-jdk ja
+  # esta disponivel diretamente nos repositorios oficiais (main/universe).
+  # Em 22.04 (jammy) e 24.04 (noble) o pacote pode estar apenas em
+  # 'universe' (ou ainda nao ter sido publicado); garantimos o repositorio
+  # 'universe' habilitado e deixamos o install_apt_packages avisar (WARN) e
+  # seguir em frente caso o pacote ainda nao exista para a versao/arquitetura.
+  if command_exists javac && javac --version 2>/dev/null | grep -q "^javac 25"; then
+    info "Java 25 (JDK) ja instalado"
+  else
+    log "Instalando Java 25 (OpenJDK)..."
+    if command_exists add-apt-repository; then
+      ${SUDO} add-apt-repository -y universe >/dev/null 2>&1 || true
+    fi
+    install_apt_packages openjdk-25-jdk
+  fi
+
+  if command_exists javac; then
+    local jhome
+    jhome="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+    local bashrc="${TARGET_HOME}/.bashrc"
+    local zshrc="${TARGET_HOME}/.zshrc"
+    ensure_line_in_file "export JAVA_HOME=${jhome}" "${bashrc}"
+    ensure_line_in_file "export JAVA_HOME=${jhome}" "${zshrc}"
+  else
+    warn "openjdk-25-jdk nao esta disponivel no repositorio desta versao/arquitetura do Ubuntu."
+    warn "Verifique com 'apt-cache policy openjdk-25-jdk' ou instale manualmente (ex.: Temurin/Adoptium ou .deb da Oracle)."
+  fi
+}
+
+install_maven() {
+  if command_exists mvn; then
+    info "Maven ja instalado"
+    return
+  fi
+
+  log "Instalando Maven..."
+  install_apt_packages maven
+
+  if ! command_exists mvn; then
+    warn "maven nao esta disponivel no repositorio desta versao/arquitetura do Ubuntu."
+    warn "Verifique com 'apt-cache policy maven' ou instale manualmente a partir de https://maven.apache.org/download.cgi"
+  fi
+}
+
+install_python() {
+  # Usamos o Python 3 padrao do proprio Ubuntu (main), sem PPA de terceiros,
+  # seguindo o mesmo espirito do install_java: a versao "default" da
+  # distribuicao ja e recente o suficiente (3.13/3.14 no 26.04) e recebe
+  # atualizacoes de seguranca via apt normalmente.
+  log "Instalando Python 3, pip, venv e pipx..."
+  install_apt_packages python3 python3-pip python3-venv python3-dev pipx
+
+  if command_exists pipx; then
+    run_as_target_user "pipx ensurepath" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_github_cli_repo() {
+  local keyring="/etc/apt/keyrings/githubcli-archive-keyring.gpg"
+  local source_file="/etc/apt/sources.list.d/github-cli.list"
+
+  ${SUDO} mkdir -p -m 755 /etc/apt/keyrings
+
+  if [[ ! -f "${keyring}" ]]; then
+    log "Configurando chave do repositorio GitHub CLI..."
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | ${SUDO} tee "${keyring}" >/dev/null
+    ${SUDO} chmod go+r "${keyring}"
+  fi
+
+  if [[ ! -f "${source_file}" ]] || ! grep -q "cli.github.com" "${source_file}"; then
+    log "Adicionando repositorio GitHub CLI..."
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=${keyring}] https://cli.github.com/packages stable main" | ${SUDO} tee "${source_file}" >/dev/null
+    APT_SOURCES_CHANGED=1
+  else
+    info "Repositorio GitHub CLI ja configurado"
+  fi
+}
+
+install_github_cli() {
+  if command_exists gh; then
+    info "GitHub CLI ja instalado"
+    return
+  fi
+
+  log "Instalando GitHub CLI..."
+  ensure_github_cli_repo
+  apt_update_once
+  install_apt_packages gh
+}
+
+ensure_local_bin_in_path() {
+  # Claude Code, Codex CLI, OpenCode CLI e Kiro CLI instalam o binario em
+  # ~/.local/bin (ou ~/.opencode/bin, no caso do OpenCode) para o usuario
+  # alvo. Garantimos que esses diretorios estejam no PATH mesmo em shells
+  # nao interativas (ex.: cron, CI, SSH sem shell de login completo).
+  local bashrc="${TARGET_HOME}/.bashrc"
+  local zshrc="${TARGET_HOME}/.zshrc"
+  local path_line='export PATH="$HOME/.local/bin:$PATH"'
+  local opencode_path_line='export PATH="$HOME/.opencode/bin:$PATH"'
+
+  ensure_line_in_file "${path_line}" "${bashrc}"
+  ensure_line_in_file "${path_line}" "${zshrc}"
+  ensure_line_in_file "${opencode_path_line}" "${bashrc}"
+  ensure_line_in_file "${opencode_path_line}" "${zshrc}"
+}
+
+install_claude_code_cli() {
+  if run_as_target_user 'command -v claude >/dev/null 2>&1 || [[ -x "${HOME}/.local/bin/claude" ]]'; then
+    info "Claude Code CLI ja instalado para ${TARGET_USER}"
+    return
+  fi
+
+  log "Instalando Claude Code CLI (instalador nativo) para ${TARGET_USER}..."
+  run_as_target_user "curl -fsSL https://claude.ai/install.sh | bash"
+}
+
+install_codex_cli() {
+  if run_as_target_user 'command -v codex >/dev/null 2>&1 || [[ -x "${HOME}/.local/bin/codex" ]]'; then
+    info "Codex CLI ja instalado para ${TARGET_USER}"
+    return
+  fi
+
+  log "Instalando Codex CLI (OpenAI, instalador nativo) para ${TARGET_USER}..."
+  run_as_target_user "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+}
+
+install_opencode_cli() {
+  if run_as_target_user 'command -v opencode >/dev/null 2>&1 || [[ -x "${HOME}/.opencode/bin/opencode" ]]'; then
+    info "OpenCode CLI ja instalado para ${TARGET_USER}"
+    return
+  fi
+
+  log "Instalando OpenCode CLI (instalador nativo) para ${TARGET_USER}..."
+  run_as_target_user "curl -fsSL https://opencode.ai/install | bash"
+}
+
+install_kiro_cli() {
+  # O binario instalado se chama "kiro-cli" (nao "kiro") e vai para
+  # ~/.local/bin, assim como o Claude Code e o Codex CLI.
+  if run_as_target_user 'command -v kiro-cli >/dev/null 2>&1 || [[ -x "${HOME}/.local/bin/kiro-cli" ]]'; then
+    info "Kiro CLI ja instalado para ${TARGET_USER}"
+    return
+  fi
+
+  log "Instalando Kiro CLI (instalador nativo) para ${TARGET_USER}..."
+  # O instalador oficial fica em cli.kiro.dev/install (nao em kiro.dev/install*).
+  if run_as_target_user "curl -fsSL https://cli.kiro.dev/install | bash"; then
+    return
+  fi
+  warn "Nao foi possivel instalar o Kiro CLI automaticamente a partir de https://cli.kiro.dev/install."
+  warn "Verifique o instalador oficial em https://kiro.dev/docs/cli/installation/"
+}
+
 main() {
   echo -e "${GREEN}=============================================${NC}"
-  echo -e "${GREEN}  INICIANDO SETUP UNIFICADO DO AMBIENTE${NC}"
+  echo -e "${GREEN} INICIANDO SETUP UNIFICADO DO AMBIENTE${NC}"
   echo -e "${GREEN}=============================================${NC}"
 
   prepare_environment
@@ -439,15 +756,20 @@ main() {
   install_composer_and_laravel
   install_zsh_stack
   install_yarn
+  install_node
   generate_ssh_key
   install_kubernetes_tools
   configure_kube_aliases_and_direnv
   install_aws_cli
   install_session_manager_plugin
   install_terraform
+  install_java
+  install_maven
+  install_python
+  install_cli_tools
 
   echo -e "${GREEN}=============================================${NC}"
-  echo -e "${GREEN}  SETUP FINALIZADO COM SUCESSO${NC}"
+  echo -e "${GREEN} SETUP FINALIZADO COM SUCESSO${NC}"
   echo -e "${GREEN}=============================================${NC}"
   info "Usuario configurado: ${TARGET_USER}"
   info "Abra um novo terminal para carregar alteracoes de shell."
