@@ -314,6 +314,15 @@ install_composer_and_laravel() {
     log "Instalando Laravel Installer globalmente..."
     run_as_target_user "COMPOSER_ALLOW_SUPERUSER=1 composer global require laravel/installer --no-interaction"
   fi
+
+  # O Laravel Installer (e 'carbon') vao para ~/.config/composer/vendor/bin
+  # (ou ~/.composer/vendor/bin em setups antigos). Esse diretorio precisa estar
+  # no PATH, senao 'laravel new' nao fica disponivel apos login.
+  local bashrc="${TARGET_HOME}/.bashrc"
+  local zshrc="${TARGET_HOME}/.zshrc"
+  local composer_bin_line='export PATH="$HOME/.config/composer/vendor/bin:$HOME/.composer/vendor/bin:$PATH"'
+  ensure_line_in_file "${composer_bin_line}" "${bashrc}"
+  ensure_line_in_file "${composer_bin_line}" "${zshrc}"
 }
 
 install_zsh_stack() {
@@ -343,10 +352,18 @@ install_zsh_stack() {
     run_as_target_user "git clone https://github.com/z-shell/F-Sy-H.git ${plugin_root}/F-Sy-H"
   fi
 
-  if [[ -f "${zshrc}" ]]; then
-    ${SUDO} sed -i -E 's/^plugins=\(.*\)$/plugins=(laravel composer git ssh-agent zsh-autosuggestions zsh-completions zsh-nvm F-Sy-H)/' "${zshrc}" || true
-  else
+  if [[ ! -f "${zshrc}" ]]; then
     run_as_target_user "touch ${zshrc}"
+  fi
+
+  # So reescreve a linha de plugins se ela ainda nao contem nossos plugins
+  # (evita sobrescrever customizacoes do usuario em re-runs do script).
+  if grep -qE '^plugins=\(' "${zshrc}"; then
+    if ! grep -qE '^plugins=\(.*zsh-autosuggestions.*\)' "${zshrc}"; then
+      ${SUDO} sed -i -E 's/^plugins=\(.*\)$/plugins=(laravel composer git ssh-agent zsh-autosuggestions zsh-completions zsh-nvm F-Sy-H)/' "${zshrc}" || true
+    fi
+  else
+    ensure_line_in_file 'plugins=(laravel composer git ssh-agent zsh-autosuggestions zsh-completions zsh-nvm F-Sy-H)' "${zshrc}"
   fi
 
   ensure_line_in_file "ZSH_AUTOSUGGEST_BUFFER_MAX_SIZE=20" "${zshrc}"
@@ -365,9 +382,25 @@ install_zsh_stack() {
     info "Tema Dracula ja instalado"
   fi
 
-  if command_exists chsh && [[ "$(getent passwd "${TARGET_USER}" | cut -d: -f7)" != "/usr/bin/zsh" ]]; then
+  # Define o tema Dracula no .zshrc. Oh-My-Zsh vem com ZSH_THEME="robbyrussell"
+  # por padrao; sem isto, os arquivos do tema sao instalados mas nunca carregados.
+  # O sed troca a linha no lugar (antes de 'source $ZSH/oh-my-zsh.sh'), que e
+  # onde o tema precisa estar definido para ser aplicado.
+  if grep -qE '^ZSH_THEME=' "${zshrc}"; then
+    ${SUDO} sed -i -E 's/^ZSH_THEME=.*/ZSH_THEME="dracula"/' "${zshrc}" || true
+  else
+    ensure_line_in_file 'ZSH_THEME="dracula"' "${zshrc}"
+  fi
+
+  local zsh_path
+  zsh_path="$(command -v zsh)"
+  if command_exists chsh && [[ -n "${zsh_path}" && "$(getent passwd "${TARGET_USER}" | cut -d: -f7)" != "${zsh_path}" ]]; then
+    # chsh so aceita shells listados em /etc/shells; garantimos a entrada.
+    if ! grep -qx "${zsh_path}" /etc/shells 2>/dev/null; then
+      echo "${zsh_path}" | ${SUDO} tee -a /etc/shells >/dev/null
+    fi
     log "Definindo ZSH como shell padrao para ${TARGET_USER}..."
-    ${SUDO} chsh -s /usr/bin/zsh "${TARGET_USER}" || warn "Nao foi possivel alterar shell padrao automaticamente"
+    ${SUDO} chsh -s "${zsh_path}" "${TARGET_USER}" || warn "Nao foi possivel alterar shell padrao automaticamente (tente 'chsh -s ${zsh_path}' manualmente apos relogin)"
   fi
 }
 
@@ -396,7 +429,11 @@ install_node() {
     info "NVM ja instalado"
   fi
 
-  if run_as_target_user "export NVM_DIR=\"${nvm_dir}\"; . \"${nvm_dir}/nvm.sh\" >/dev/null 2>&1; command -v node >/dev/null 2>&1"; then
+  # Atencao: nao basta checar 'command -v node' para decidir se o NVM ja tem
+  # um Node instalado. O pacote apt 'yarn' (e outros) pode instalar o nodejs
+  # do sistema em /usr/bin/node, o que faria o check passar mesmo sem o NVM
+  # ter instalado qualquer versao. Verificamos direto no diretorio de versoes.
+  if [[ -n "$(ls -A "${nvm_dir}/versions/node" 2>/dev/null)" ]]; then
     info "Node.js ja instalado via NVM"
   else
     log "Instalando Node.js (ultima LTS) via NVM..."
@@ -430,9 +467,10 @@ install_kubernetes_tools() {
 
   if ! command_exists kubectl; then
     log "Instalando kubectl (${arch})..."
-    curl -fsSLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${arch}/kubectl"
-    chmod +x kubectl
-    ${SUDO} mv kubectl /usr/local/bin/
+    curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${arch}/kubectl"
+    chmod +x /tmp/kubectl
+    ${SUDO} install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+    rm -f /tmp/kubectl
   else
     info "kubectl ja instalado"
   fi
@@ -446,17 +484,19 @@ install_kubernetes_tools() {
 
   if ! command_exists hetzner-k3s; then
     log "Instalando hetzner-k3s (${arch})..."
-    ${SUDO} wget -q "https://github.com/vitobotta/hetzner-k3s/releases/latest/download/hetzner-k3s-linux-${arch}" -O /usr/local/bin/hetzner-k3s
-    ${SUDO} chmod +x /usr/local/bin/hetzner-k3s
+    # Usa curl (wget nao e garantido pelo prepare_environment) e baixa em /tmp.
+    curl -fsSL -o /tmp/hetzner-k3s "https://github.com/vitobotta/hetzner-k3s/releases/latest/download/hetzner-k3s-linux-${arch}"
+    ${SUDO} install -m 0755 /tmp/hetzner-k3s /usr/local/bin/hetzner-k3s
+    rm -f /tmp/hetzner-k3s
   else
     info "hetzner-k3s ja instalado"
   fi
 
   if ! command_exists hcloud; then
     log "Instalando hcloud CLI (${arch})..."
-    curl -fsSLO "https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-${arch}.tar.gz"
-    ${SUDO} tar -C /usr/local/bin --no-same-owner -xzf "hcloud-linux-${arch}.tar.gz" hcloud
-    rm -f "hcloud-linux-${arch}.tar.gz"
+    curl -fsSL -o "/tmp/hcloud-linux-${arch}.tar.gz" "https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-${arch}.tar.gz"
+    ${SUDO} tar -C /usr/local/bin --no-same-owner -xzf "/tmp/hcloud-linux-${arch}.tar.gz" hcloud
+    rm -f "/tmp/hcloud-linux-${arch}.tar.gz"
   else
     info "hcloud CLI ja instalado"
   fi
@@ -603,6 +643,9 @@ install_java() {
     info "Java 25 (JDK) ja instalado"
   else
     log "Instalando Java 25 (OpenJDK)..."
+    # add-apt-repository vem de software-properties-common; garantimos que ele
+    # esteja presente antes de tentar habilitar o repositorio universe.
+    install_apt_packages software-properties-common
     if command_exists add-apt-repository; then
       ${SUDO} add-apt-repository -y universe >/dev/null 2>&1 || true
     fi
@@ -772,7 +815,9 @@ main() {
   echo -e "${GREEN} SETUP FINALIZADO COM SUCESSO${NC}"
   echo -e "${GREEN}=============================================${NC}"
   info "Usuario configurado: ${TARGET_USER}"
-  info "Abra um novo terminal para carregar alteracoes de shell."
+  warn 'Para o ZSH virar o shell padrao de fato (e $SHELL ser reavaliado), encerre'
+  warn 'a SESSAO GRAFICA inteira (logout) e entre de novo, ou reinicie a maquina.'
+  warn 'So reabrir o terminal nao basta: a sessao atual ainda carrega $SHELL antigo.'
 }
 
 main "$@"
